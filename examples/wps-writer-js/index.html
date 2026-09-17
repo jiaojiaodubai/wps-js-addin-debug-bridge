@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>WPS 文字 · Hello World（纯 JS）</title>
+  </head>
+  <body>
+    <!--
+      这个文件是 WPS 加载项的入口，WPS 启动加载项时会加载它。
+      纯 JS 示例刻意不用打包器：直接按顺序用 <script> 加载，函数即为全局函数，
+      于是 ribbon.xml 里的 onLoad="OnAddinLoad" / onAction="OnAction" 能直接找到它们。
+
+      加载顺序：纯逻辑 → 宿主访问 → Ribbon 回调（回调要用到前面的函数）。
+    -->
+    <script src="./js/util.js"></script>
+    <script src="./js/hello.js"></script>
+    <script src="./js/host.js"></script>
+    <script src="./js/ribbon.js"></script>
+  </body>
+</html>

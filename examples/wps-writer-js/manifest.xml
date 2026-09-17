@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<JsPlugin>
+  <ApiVersion>1.0.0</ApiVersion>
+  <Name>HelloWriterJs</Name>
+  <Description>WPS 文字 Hello World 加载项（纯 JS，无打包器）+ wps-js-addin-debug-bridge 接入示例</Description>
+</JsPlugin>

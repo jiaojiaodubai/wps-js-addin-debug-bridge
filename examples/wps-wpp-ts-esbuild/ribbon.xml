@@ -1,0 +1,12 @@
+<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="OnAddinLoad">
+    <ribbon startFromScratch="false">
+        <tabs>
+            <tab id="helloWppTab" label="Hello 示例">
+                <group id="helloWppGroup" label="调试桥示例">
+                    <button id="btnHello" label="写入 Hello World" onAction="OnAction" getEnabled="OnGetEnabled" size="large"/>
+                    <button id="btnRunTests" label="在加载项里跑测试" onAction="OnAction" size="large"/>
+                </group>
+            </tab>
+        </tabs>
+    </ribbon>
+</customUI>

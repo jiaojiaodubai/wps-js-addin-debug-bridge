@@ -1,0 +1,59 @@
+{
+  "name": "wps-js-addin-debug-bridge",
+  "version": "0.1.0",
+  "description": "WPS JS 加载项开发期调试桥：在终端里触发 Ribbon 入口、在运行中的加载项里执行代码",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jiaojiaodubai/wps-js-addin-debug-bridge.git"
+  },
+  "homepage": "https://github.com/jiaojiaodubai/wps-js-addin-debug-bridge#readme",
+  "bugs": "https://github.com/jiaojiaodubai/wps-js-addin-debug-bridge/issues",
+  "exports": {
+    ".": {
+      "types": "./src/vite-plugin.d.ts",
+      "default": "./src/vite-plugin.js"
+    },
+    "./server": {
+      "types": "./src/server.d.ts",
+      "default": "./src/server.js"
+    },
+    "./client": "./src/client.js",
+    "./protocol": "./src/protocol.js",
+    "./runner": "./src/runner.js",
+    "./package.json": "./package.json"
+  },
+  "types": "./src/vite-plugin.d.ts",
+  "bin": {
+    "wps-bridge": "./bin/cli.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "docs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/runner.test.js test/bridge.test.js test/server.test.js test/types.test.js test/examples.test.js"
+  },
+  "keywords": [
+    "wps",
+    "wpsjs",
+    "加载项",
+    "调试",
+    "自动化",
+    "vite"
+  ],
+  "peerDependencies": {
+    "vite": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    }
+  }
+}

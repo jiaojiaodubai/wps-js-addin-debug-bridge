@@ -1,0 +1,14 @@
+{
+  "name": "wps-writer-js-hello",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WPS 文字 Hello World 加载项（纯 JS，无打包器）+ wps-js-addin-debug-bridge 接入示例",
+  "scripts": {
+    "dev": "node dev-server.js",
+    "test:wps": "wps-bridge run ./test/hello.test.js --expect-report --start \"npm run dev\""
+  },
+  "devDependencies": {
+    "wps-js-addin-debug-bridge": "file:../.."
+  }
+}

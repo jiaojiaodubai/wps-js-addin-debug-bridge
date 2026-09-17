@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>WPS 演示 · Hello World（TS + esbuild）</title>
+  </head>
+  <body>
+    <!--
+      开发模式：dev-server.js 会把这个 .ts 按需打包成一份 ESM 再交给页面。
+      发布模式：build.js 把它打包成 ./js/main.js，并顺手改写这一行（见 build.js）。
+    -->
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

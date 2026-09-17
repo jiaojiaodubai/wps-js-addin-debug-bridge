@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# 桥在运行时写的端口/token 文件（dev server 自动生成，终端自动读取）
+.wps-bridge.json
