@@ -1,5 +1,10 @@
 # wps-js-addin-debug-bridge
 
+[![CI](https://github.com/jiaojiaodubai/wps-js-addin-debug-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/jiaojiaodubai/wps-js-addin-debug-bridge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/jiaojiaodubai/wps-js-addin-debug-bridge)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](package.json)
+[![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](package.json)
+
 WPS JS 加载项的**开发期调试桥**：让终端（脚本、CI、AI Agent）能够
 
 - **触发页面上的入口** —— `wps-bridge click btnRunTests`，等价于“替用户点一下 Ribbon 按钮”；
