@@ -12,12 +12,13 @@ sequenceDiagram
   participant P as 加载项页面 (client.js)
   participant W as WPS 宿主
 
-  P->>D: GET /poll 长轮询（同时是心跳）
+  P-)D: POST /report 信标 beacon（Web Worker 线程，5 s 一次，带 mainTickAt）
+  P->>D: GET /poll 长轮询收命令
   T->>D: POST /submit 下发命令
   D->>P: 轮询返回命令
   P->>P: 执行 click / call / run / eval
   P->>W: 通过宿主 API 操作文档
-  P->>D: POST /report 回传 started / busy / log / result
+  P->>D: POST /report 回传 started / log / result
   D->>T: 事件流（GET /events）
 ```
 
@@ -41,7 +42,8 @@ sequenceDiagram
 | --- | --- |
 | 命令为什么要有 clientId、重发为什么要复用 id | [src/bridge.js](../src/bridge.js) 顶部与 `createCommandQueue` |
 | 为什么页面侧要按 id 去重、为什么日志带 commandId | [src/client.js](../src/client.js) 顶部与 `handleCommand` |
-| 为什么执行要有上限、为什么要发 busy 心跳 | [src/client.js](../src/client.js) `withTimeout`、`handleCommand` |
+| 为什么执行要有上限、为什么信标要放在 Web Worker | [src/client.js](../src/client.js) `withTimeout`、`startBeacons` |
+| 客户端状态（idle/busy/stalled/offline）是怎么推导的 | [src/bridge.js](../src/bridge.js) `createClientRegistry` |
 | 事件日志为什么是环形的、丢了怎么告知 | [src/bridge.js](../src/bridge.js) `createEventLog` |
 | 为什么只放本机同源、token 怎么流转 | [src/server.js](../src/server.js) `defaultOriginGuard`、`announce` |
 | 为什么 stdout/stderr 要分开 | [src/logger.js](../src/logger.js) 顶部 |

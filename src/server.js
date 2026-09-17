@@ -83,13 +83,14 @@ export function defaultOriginGuard({ host = "", origin = "" } = {}) {
 
 /**
  * 生成注入到 HTML 里的页面侧选项（插件与其它 dev server 共用）。
- * @param {{ readyCheck?: string, readyTimeoutMs?: number, commandTimeoutMs?: number, token?: string }} [options]
+ * @param {{ readyCheck?: string, readyTimeoutMs?: number, commandTimeoutMs?: number, heartbeatMs?: number, token?: string }} [options]
  */
 export function bridgeClientOptions(options = {}) {
   const clientOptions = {
     readyCheck: options.readyCheck ?? DEFAULT_READY_CHECK,
     readyTimeoutMs: options.readyTimeoutMs,
     commandTimeoutMs: options.commandTimeoutMs,
+    heartbeatMs: options.heartbeatMs,
   }
   if (options.token) clientOptions.token = options.token
   return clientOptions
@@ -98,7 +99,7 @@ export function bridgeClientOptions(options = {}) {
 /**
  * 页面侧的两段注入脚本：先设置选项，再加载客户端模块。
  * 非 vite 的 dev server 把它拼进 HTML 即可（也可用 injectBridgeClient）。
- * @param {{ readyCheck?: string, readyTimeoutMs?: number, commandTimeoutMs?: number, token?: string }} [options]
+ * @param {{ readyCheck?: string, readyTimeoutMs?: number, commandTimeoutMs?: number, heartbeatMs?: number, token?: string }} [options]
  */
 export function bridgeClientTags(options = {}) {
   return `<script>window.${CLIENT_OPTIONS_GLOBAL} = ${JSON.stringify(bridgeClientOptions(options))}</script>`
@@ -108,7 +109,7 @@ export function bridgeClientTags(options = {}) {
 /**
  * 把页面侧客户端注入 HTML（改成 `</body>` 前，没有 body 就追加到末尾）。
  * @param {string} html
- * @param {{ readyCheck?: string, readyTimeoutMs?: number, commandTimeoutMs?: number, token?: string }} [options]
+ * @param {{ readyCheck?: string, readyTimeoutMs?: number, commandTimeoutMs?: number, heartbeatMs?: number, token?: string }} [options]
  */
 export function injectBridgeClient(html, options = {}) {
   const tags = bridgeClientTags(options)
@@ -145,6 +146,8 @@ function readJsonBody(request) {
  * @param {string} [options.readyCheck] 页面就绪判定的 JS 表达式
  * @param {number} [options.readyTimeoutMs] 等待页面就绪的上限
  * @param {number} [options.commandTimeoutMs] 单条命令在页面里的执行上限
+ * @param {number} [options.heartbeatMs] 页面侧信标间隔（ms），默认 5000
+ * @param {number} [options.blockedAfterMs] 信标/主线程多久没动静算异常（ms），默认 15000
  * @param {string|boolean} [options.token] 是否要求页面/终端带上 token（`true` 为随机生成）
  * @param {(context: { host: string, origin: string }) => boolean} [options.originGuard] 自定义放行规则
  * @param {string|false} [options.portFile] 端口/token 落地文件，默认项目目录下的 .wps-bridge.json

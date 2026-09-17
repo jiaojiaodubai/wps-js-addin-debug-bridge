@@ -56,6 +56,36 @@ export const EXIT = {
 /** 由 --start 拉起的 dev server，退出时要一起收拾。 */
 const activeChildren = new Set()
 
+/**
+ * 由 --launch 拉起的 WPS launcher 进程：退出时要把它收回去（谁启动谁负责，本来开着的实例不碰）。
+ *
+ * 子进程退出后**不**从集合里删：launcher 自己退出说明启动请求并入了已经在跑的实例
+ * （WPS 是单实例），收尾时正是靠这个信号判断“这个实例不是我们拉起的”。
+ */
+const launchedWps = new Set()
+
+/** 探针文档所在目录（`--launch` 没给 `--doc` 时用）。 */
+export const PROBE_DOC_DIR = path.join(os.tmpdir(), "wps-bridge")
+
+/**
+ * 探针文档：没有 `--doc` 时用它把加载项页面“唤起来”。
+ *
+ * 页面只在文档打开时才创建（停在首页不算），所以 --launch 必须带上一个文档：
+ *   - 必须是**真实存在**的文件：传一个不存在的路径 WPS 不会打开任何文档（本机实测）；
+ *   - 必须是**只可能由 WPS 文字打开**的类型：`.txt` 会弹“请选择打开文件的方式”
+ *     （文字/表格都可能），那个弹窗是模态的，页面就永远等不到了。`.rtf` 没有歧义。
+ * 文档留在系统临时目录不删：WPS 会把它记进最近文档，删掉反而让下次启动拿到一个打不开的路径。
+ * @returns {string} 探针文档路径
+ */
+export function ensureProbeDocument(dir = PROBE_DOC_DIR) {
+  fs.mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, "probe.rtf")
+  if (!fs.existsSync(file)) {
+    fs.writeFileSync(file, "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Calibri;}}\\f0 wps-js-addin-debug-bridge 探针文档，可以随时删除。}\n", "utf8")
+  }
+  return file
+}
+
 /** 解析命令行参数（纯函数，便于单测）。 */
 export function parseArgs(argv) {
   const options = {
@@ -68,6 +98,7 @@ export function parseArgs(argv) {
     doc: "",
     start: "npm run dev",
     keepServer: false,
+    keepWps: false,
     expectReport: false,
     reportPattern: DEFAULT_REPORT_PATTERN,
     reporter: "regex",
@@ -110,6 +141,7 @@ export function parseArgs(argv) {
     }
     else if (current === "--launch") options.launch = true
     else if (current === "--keep-server") options.keepServer = true
+    else if (current === "--keep-wps") options.keepWps = true
     else if (current === "--expect-report") options.expectReport = true
     else if (current === "--no-hook") options.useHook = false
     else if (current === "--fresh") options.fresh = true
@@ -249,11 +281,12 @@ export const USAGE = `wps-bridge —— WPS JS 加载项开发期调试桥
   --arg <值>            call / run 的单个参数，可重复；能当 JSON 解析就按 JSON 传
   --args <json>         call / run 的参数数组（JSON）
   --token <值>          桥要求 token 时用（一般会从 .wps-bridge.json 自动读到）
-  --launch              没有页面接入时自动启动 WPS
-  --doc <path>          配合 --launch 打开指定文档
+  --launch              没有页面接入时自动启动 WPS（自动打开文档唤起页面；跑完自动关掉）
+  --doc <path>          配合 --launch 打开的文档（不给就用临时目录里的探针文档）
   --exe <path>          指定 wps.exe（也可用环境变量 WPS_EXE）
   --start <命令>        本地没有 dev server 时用该命令启动（默认 "npm run dev"）
   --keep-server         本次启动的 dev server 保留不关
+  --keep-wps            保留 --launch 拉起的 WPS（默认跑完关掉；本来开着的实例不碰）
   --no-hook             不启用页面钩子（恢复加载项自身的模态提示）
   --quiet               只输出错误（诊断信息都在 stderr）
 
@@ -411,6 +444,125 @@ export function stopAllServers() {
   for (const child of [...activeChildren]) stopServer(child)
 }
 
+/** 强杀后等进程退出的时间。 */
+const WPS_STOP_GRACE_MS = 5_000
+
+/** 页面退出后的等待时间：Quit 已经送到，留一拍让它真的把进程收掉。 */
+const QUIT_SETTLE_MS = 2_000
+
+function waitForExit(child, milliseconds) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    const onExit = () => {
+      clearTimeout(timer)
+      resolve(true)
+    }
+    const timer = setTimeout(() => {
+      child.off("exit", onExit)
+      resolve(false)
+    }, milliseconds)
+    child.once("exit", onExit)
+  })
+}
+
+/**
+ * 关掉由 --launch 拉起的 WPS launcher 进程（连它的子进程一起）。
+ *
+ * 这里直接强杀，不做“温和关闭”：实测 `taskkill`（不带 `/F`，相当于给顶层窗口发 WM_CLOSE）
+ * 会停在保存提示上 —— 提示是模态的，自动化里没人能点，进程就一直挂着。
+ * 温和的那一步由页面侧的 `Application.Quit(0)` 负责（见 quitViaPage）；
+ * 走到这里时实例只剩 launcher 留下的窗口壳。
+ * @returns {Promise<boolean>} 进程是否已退出
+ */
+export async function stopWps(child, { graceMs = WPS_STOP_GRACE_MS } = {}) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return true
+  try {
+    if (process.platform === "win32") {
+      execFileSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" })
+    }
+    else {
+      // 拉起的进程自成进程组：杀整组，别留下它自己拉起的子进程
+      process.kill(-child.pid, "SIGKILL")
+    }
+  }
+  catch {
+    // 进程可能刚好自己退出了；也可能没有独立进程组，下面兜一下
+    try {
+      child.kill("SIGKILL")
+    }
+    catch {
+      // 忽略
+    }
+  }
+  return waitForExit(child, graceMs)
+}
+
+/**
+ * 让页面自己 `Application.Quit(0)`：精确关掉“服务这个页面的那个实例”。
+ *
+ * 为什么不用进程级关闭代替：`--launch` 拉起的实例里，窗口由 launcher 进程持有，
+ * 进程级要么发 WM_CLOSE（撞上保存提示就永远停着），要么强杀（丢数据）。
+ * 页面里的 `Quit(0)` 是“不保存、不提示”，而且只影响页面所在的那个实例。
+ * 命令送到就行 —— Quit 之后页面自己就没了，等它的结果只会白等。
+ * @returns {Promise<boolean>} 页面是否已经退出
+ */
+async function quitViaPage(endpoint, logger, target = "newest") {
+  const status = await getJson(apiUrl(endpoint, "status"), endpoint).catch(() => null)
+  const clientId = pickClient(status, target)
+  if (!clientId) return false
+
+  const payload = await postJson(apiUrl(endpoint, "submit"), {
+    kind: "eval",
+    // 只是把 Quit 排进队列，别让命令的返回把 Quit 挡住
+    code: 'setTimeout(() => Application.Quit(0), 0); return "quit"',
+    id: `eval-${Date.now()}-quit`,
+    clientId,
+    useHook: false,
+  }, endpoint).catch(() => null)
+  if (!payload || payload.ok === false) return false
+  logger.info(`已请页面 ${clientId} 退出 WPS（Application.Quit(0)：不保存、不弹提示）`)
+
+  await delay(QUIT_SETTLE_MS)
+  const after = await getJson(apiUrl(endpoint, "status"), endpoint).catch(() => null)
+  const client = (after?.clients ?? []).find(item => item.id === clientId)
+  return !client || client.state === "offline"
+}
+
+/** Ctrl-C 时把拉起的 WPS 也收拾掉（这时不需要温和）。 */
+export function stopAllWps() {
+  for (const child of [...launchedWps]) {
+    if (child.exitCode !== null || child.signalCode !== null) continue
+    try {
+      if (process.platform === "win32") execFileSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" })
+      else child.kill("SIGKILL")
+    }
+    catch {
+      // 忽略
+    }
+  }
+}
+
+/** 跑完把 --launch 拉起的 WPS 关掉：测试要闭环，机器回到开跑前的样子。 */
+async function stopLaunchedWps(options, logger, endpoint) {
+  for (const child of [...launchedWps]) {
+    if (options.keepWps) {
+      logger.info(`本次启动的 WPS 保留不关（--keep-wps，pid ${child.pid}）`)
+      continue
+    }
+    // 启动请求并入了已经在跑的实例：那个实例不是我们拉起的，不关它
+    if (child.exitCode !== null || child.signalCode !== null) {
+      logger.info("启动请求并入了已在运行的 WPS 实例：本次不关闭它（--launch 只关自己拉起的实例）")
+      continue
+    }
+    logger.info(`正在关闭本次启动的 WPS（pid ${child.pid}；--keep-wps 可保留）`)
+    const quit = endpoint ? await quitViaPage(endpoint, logger, options.target) : false
+    if (!quit) logger.warn("页面没有确认退出（没有页面接入，或主线程没响应）：接下来的进程级关闭会直接结束实例，未保存内容会丢")
+    const stopped = await stopWps(child)
+    if (stopped) logger.info(`已关闭 WPS（pid ${child.pid}）`)
+    else logger.warn(`没能关掉 WPS（pid ${child.pid}）`)
+  }
+}
+
 /** 按注册表/安装目录找 wps.exe（只有 --launch 时才需要）。 */
 export function resolveWpsExe(explicitPath) {
   if (explicitPath && fs.existsSync(explicitPath)) return explicitPath
@@ -438,38 +590,70 @@ export function resolveWpsExe(explicitPath) {
 }
 
 function launchWps(exePath, documentPath, logger) {
-  const args = ["/prometheus", "/wps"]
-  if (documentPath) args.push(documentPath)
-  logger.info(`启动 WPS：${exePath}${documentPath ? ` ${documentPath}` : ""}`)
+  // 页面只在文档打开时才创建：没给 --doc 就用探针文档，否则启动完还是等不到页面
+  const document = documentPath || ensureProbeDocument()
+  if (!documentPath) logger.info(`未指定 --doc：用探针文档唤起加载项页面（${document}）`)
+  else if (!fs.existsSync(documentPath)) logger.warn(`--doc 指向的文件不存在：${documentPath} —— WPS 不会真的打开它，页面可能不会出现`)
+
+  const args = ["/prometheus", "/wps", document]
+  logger.info(`启动 WPS：${exePath} ${document}`)
   const child = spawn(exePath, args, { detached: true, stdio: "ignore", windowsHide: true })
   child.unref()
+  // WPS 单实例：与已打开的实例合并时这个进程会自己退出 —— 收尾时就靠这个信号
+  // 判断“实例不是我们拉起的”，所以这里不把它从集合里删掉（见 stopLaunchedWps）
+  launchedWps.add(child)
+  return child
 }
 
-/** 从状态里挑一个页面：优先最新且没被卡住的（被弹窗卡住的页面拿不到命令）。 */
+/** 从状态里挑一个页面：优先最新且“信标正常、主线程在推进”的（失联/无响应的会拖住命令）。 */
 export function pickClient(status, target) {
   const clients = status?.clients ?? []
   if (clients.length === 0) return null
   if (target && target !== "newest") {
     return clients.some(client => client.id === target) ? target : null
   }
-  const usable = clients.filter(client => client.state !== "blocked")
-  return (usable.at(-1) ?? clients.at(-1)).id
+  const responsive = clients.filter(client => client.state !== "offline" && client.state !== "stalled")
+  const reachable = clients.filter(client => client.state !== "offline")
+  return (responsive.at(-1) ?? reachable.at(-1) ?? clients.at(-1)).id
+}
+
+/**
+ * 等页面时用的挑选：只剩失联页面就等于“没有页面”。
+ *
+ * 收尾关掉 WPS 之后，旧的页面登记还要过一会儿才被回收；紧接着跑下一轮时，
+ * 它看起来就是个“页面”—— 命令送进去只会石沉大海，--launch 也不会去启动新实例。
+ * 指定了 --target 时不这么算：用户指定了哪个页面，失败原因就直接告诉他。
+ */
+export function pickUsableClient(status, target) {
+  const clientId = pickClient(status, target)
+  if (!clientId || (target && target !== "newest")) return clientId
+  const client = (status?.clients ?? []).find(item => item.id === clientId)
+  return client?.state === "offline" ? null : clientId
 }
 
 async function waitForClient(endpoint, options, logger) {
   const startedAt = Date.now()
   const deadline = startedAt + CLIENT_WAIT_TIMEOUT_MS
   let launched = false
+  let toldOffline = false
 
   while (Date.now() < deadline) {
     const status = await getJson(apiUrl(endpoint, "status"), endpoint).catch(() => null)
-    const clientId = pickClient(status, options.target)
+    const clientId = pickUsableClient(status, options.target)
     if (clientId) {
       const client = status.clients.find(item => item.id === clientId)
-      if (client?.state === "blocked") {
-        logger.warn(`选中的页面 ${clientId} 被卡住了（心跳停了，多半是宿主弹窗），命令可能送不进去`)
+      if (client?.state === "stalled") {
+        logger.warn(`选中的页面 ${clientId} 主线程 ${client.mainStallMs} ms 没有响应（宿主弹窗或长同步任务都可能），命令可能延迟执行`)
+      }
+      else if (client?.state === "offline") {
+        logger.warn(`选中的页面 ${clientId} 信标停了 ${client.beaconAgeMs} ms（页面可能已关闭或崩溃），命令可能送不进去`)
       }
       return clientId
+    }
+    if (!toldOffline && (status?.clients ?? []).some(client => client.state === "offline")) {
+      const stale = status.clients.filter(client => client.state === "offline").map(client => client.id).join(", ")
+      logger.info(`已连接的页面都失联了（${stale}）：等一个新页面接入（页面登记会过期回收）`)
+      toldOffline = true
     }
     if (options.target !== "newest" && status && Date.now() - startedAt > EXPLICIT_TARGET_GRACE_MS) {
       const ids = (status.clients ?? []).map(client => client.id).join(", ") || "（无）"
@@ -556,8 +740,12 @@ async function submitWithAck(endpoint, command, pump, state, deadline, options, 
 }
 
 function stateLabel(client) {
+  if (client.state === "offline") return `失联：信标停了 ${client.beaconAgeMs} ms（页面已关闭或崩溃）`
+  if (client.state === "stalled") {
+    const doing = client.busyCommandId ? `命令 ${client.busyCommandId} 执行中` : "当前没有命令在执行"
+    return `主线程无响应：${client.mainStallMs} ms 没有推进（${doing}；宿主弹窗或长同步任务都可能）`
+  }
   if (client.state === "busy") return `执行中：${client.busyCommandId}（已 ${client.busyMs} ms）`
-  if (client.state === "blocked") return `被卡住：${client.busyCommandId} 执行中心跳停了（多半是宿主弹窗）`
   return "空闲"
 }
 
@@ -572,7 +760,7 @@ async function printStatus(endpoint, logger, stdout) {
   else {
     logger.info(`已连接的页面：${status.clients.map(client => client.id).join(", ")}`)
     for (const client of status.clients) {
-      logger.info(`  ${client.id}：${stateLabel(client)}；${client.idleMs} ms 前说过话`)
+      logger.info(`  ${client.id}：${stateLabel(client)}；信标 ${client.beaconMode || "未知"}（${client.beaconAgeMs} ms 前），${client.idleMs} ms 前说过话`)
     }
   }
   logger.info(`排队中的命令：${status.queuedCommands}；事件序号：${status.eventSeq}`)
@@ -612,6 +800,12 @@ export async function run(options, { stdout = process.stdout, logger = createLog
 
     const client = await waitForClient(endpoint, options, logger)
     if (!client) {
+      const status = await getJson(apiUrl(endpoint, "status"), endpoint).catch(() => null)
+      const stale = (status?.clients ?? []).filter(item => item.state === "offline")
+      if (stale.length > 0) {
+        // 失联的页面会在登记表里留到过期为止：说清楚，免得看起来像“桥没接上”
+        logger.error(`只看得到失联的页面：${stale.map(item => `${item.id}（信标停了 ${item.beaconAgeMs} ms）`).join("、")}`)
+      }
       logger.error("没有等到页面接入桥。请确认：")
       logger.error("  1) dev server 正在运行，且配置里启用了 wpsDebugBridge 插件或 createBridgeMiddleware；")
       logger.error("  2) 宿主应用已重新加载开发版加载项（重启，或用 --launch 自动启动）。")
@@ -708,6 +902,8 @@ export async function run(options, { stdout = process.stdout, logger = createLog
     return exitCode
   }
   finally {
+    // 先收 WPS 再收 dev server：页面用 Quit 退出时要经过桥的 API 确认
+    await stopLaunchedWps(options, logger, endpoint)
     if (server && !options.keepServer) {
       stopServer(server)
       logger.info("已关闭本次启动的 dev server")
@@ -720,12 +916,16 @@ async function explainTimeout(endpoint, state, options, logger) {
   const status = await getJson(apiUrl(endpoint, "status"), endpoint).catch(() => null)
   const client = status?.clients?.find(item => item.id === (state.clientId ?? pickClient(status, options.target)))
 
-  if (client?.state === "blocked") {
-    logger.error(`命令超时：页面 ${client.id} 心跳停了，多半是宿主弹窗冻结了页面 —— 先关掉弹窗。`)
+  if (client?.state === "offline") {
+    logger.error(`命令超时：页面 ${client.id} 的信标停了 ${client.beaconAgeMs} ms —— 页面多半已关闭或崩溃，不是弹窗。`)
+  }
+  else if (client?.state === "stalled") {
+    logger.error(`命令超时：页面 ${client.id} 还在（信标正常），但主线程已 ${client.mainStallMs} ms 没有推进。`)
+    logger.error("先去 WPS 里看一眼有没有弹窗；没有的话，就是这条命令卡在自己的同步宿主调用上了。")
   }
   else if (client?.state === "busy") {
-    logger.error(`命令超时：页面仍在执行 ${client.busyCommandId}（已 ${client.busyMs} ms），可能是死循环或等不到的东西。`)
-    logger.error("页面里的 JS 杀不掉，只能重载加载项；页面侧的超时上限见 options.commandTimeoutMs。")
+    logger.error(`命令超时：页面仍在执行 ${client.busyCommandId}（已 ${client.busyMs} ms），主线程还有响应。`)
+    logger.error("页面里的 JS 杀不掉，只能重载加载项；页面侧的执行上限见 options.commandTimeoutMs。")
   }
   else if (state.started) {
     logger.error(`命令超时：页面已开始执行但 ${options.timeout} ms 内没有结果（可能是异步任务一直没结束）。`)
@@ -747,9 +947,10 @@ export async function main(argv = process.argv.slice(2)) {
     return EXIT.failed
   }
 
-  // Ctrl-C 也要把 --start 拉起的 dev server 收拾干净（run() 的 finally 不会执行）
+  // Ctrl-C 也要把 --start 拉起的 dev server 与 --launch 拉起的 WPS 收拾干净
   const onSignal = (signal) => {
     stopAllServers()
+    stopAllWps()
     process.exit(signal === "SIGINT" ? 130 : 143)
   }
   process.once("SIGINT", onSignal)

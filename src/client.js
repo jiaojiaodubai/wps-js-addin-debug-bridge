@@ -12,8 +12,9 @@
  *     同一条命令只执行一次，重发时补发上次的结果；
  *   - **页面里的 JS 杀不掉**，所以给每条命令加执行上限，超时就明确报错，
  *     而不是让终端干等到全局超时；
- *   - **执行期间照样上报心跳**（type: busy），这样“在跑”和“被宿主弹窗冻结”
- *     在终端看起来是两回事；
+ *   - **信标必须放在独立线程**：页面只有一个 JS 线程，长任务的同步段（WPS 宿主
+ *     调用基本都是同步的）会把定时器饿死，主线程心跳看起来和被宿主弹窗冻结一样。
+ *     所以信标由 Web Worker 发送，并带上主线程的 mainTickAt（见 startBeacons）；
  *   - **日志带上命令 id**，多命令/多页面时不至于分不清哪条日志是谁的。
  *
  * 命令协议见 src/protocol.js，服务端在 src/server.js，终端侧在 src/runner.js。
@@ -95,6 +96,100 @@ function patchConsole() {
       report({ type: "log", level, text: args.map(stringify).join(" "), commandId: currentCommandId })
     }
   }
+}
+
+/**
+ * 信标（beacon）：页面进程与主线程各报各的。
+ *
+ * 为什么不用“主线程定时器 + fetch”当心跳：页面只有一个 JS 线程，长任务的同步段
+ * 会把定时器饿死 —— 心跳发不出去，看起来和被弹窗冻结一样，终端只能靠人去看有没有弹窗。
+ * 所以信标改由 Web Worker（独立线程）发送：
+ *   - 信标本身按时到达，证明“页面进程还活着”；
+ *   - 信标里的 mainTickAt（主线程最近一次 tick），证明“主线程还在推进”。
+ * 服务端把两条信号分开解读：信标停了 = 失联；信标在、主线程不推进 = 无响应。
+ * 真正的“为什么卡住”（长同步任务 vs 宿主弹窗）从外面分不出来，所以也不装作分得出来。
+ *
+ * Worker 起不来时（宿主内核裁剪 / CSP / 页面模拟器）退回主线程信标：
+ * 功能仍然可用，只是重新受同步任务影响（此时“失联”可能只是被饿死）。
+ */
+const BEACON_WORKER_SOURCE = `
+let heartbeatMs = 5000
+let clientId = ""
+let url = ""
+let headers = {}
+let lastTickAt = 0
+self.onmessage = (event) => {
+  const message = event.data || {}
+  if (message.type === "init") {
+    heartbeatMs = message.heartbeatMs || heartbeatMs
+    clientId = message.clientId
+    url = message.url
+    headers = message.headers || {}
+    lastTickAt = Date.now()
+    self.postMessage({ type: "ready" })
+    setInterval(send, heartbeatMs)
+    send()
+  }
+  else if (message.type === "tick") {
+    lastTickAt = Date.now()
+  }
+}
+function send() {
+  if (!url) return
+  fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ client: clientId, event: { type: "beacon", mode: "worker", mainTickAt: lastTickAt } }),
+    keepalive: true,
+  }).catch(() => {})
+}
+`
+
+/** 主线程兜底信标：Worker 不可用时才走这条路。 */
+function startMainBeacon() {
+  return setInterval(() => {
+    report({ type: "beacon", mode: "main", mainTickAt: Date.now() })
+  }, heartbeatMs)
+}
+
+/** 启动信标；返回计时器（只是留着，页面生命周期内一直跑）。 */
+function startBeacons() {
+  try {
+    if (typeof Worker === "function" && typeof Blob === "function" && typeof URL?.createObjectURL === "function") {
+      const workerUrl = URL.createObjectURL(new Blob([BEACON_WORKER_SOURCE], { type: "text/javascript" }))
+      const worker = new Worker(workerUrl)
+      let workerTicker = null
+      let fellBack = false
+      worker.onmessage = () => URL.revokeObjectURL(workerUrl)
+      worker.onerror = () => {
+        // 起不来（CSP、内核裁剪…）：退回主线程信标，别让桥这边直接“失联”
+        if (fellBack) return
+        fellBack = true
+        clearInterval(workerTicker)
+        try {
+          worker.terminate()
+        }
+        catch {
+          // 忽略
+        }
+        URL.revokeObjectURL(workerUrl)
+        startMainBeacon()
+      }
+      worker.postMessage({
+        type: "init",
+        clientId: CLIENT_ID,
+        heartbeatMs,
+        url: new URL(`${API_PREFIX}/report`, location.href).href,
+        headers: bridgeHeaders(),
+      })
+      workerTicker = setInterval(() => worker.postMessage({ type: "tick" }), heartbeatMs)
+      return workerTicker
+    }
+  }
+  catch {
+    // 宿主不支持 Worker：走下面的主线程兜底
+  }
+  return startMainBeacon()
 }
 
 function isPageReady() {
@@ -245,10 +340,9 @@ async function handleCommand(command) {
   // 回报“已收到”：长轮询可能把命令交给一个刚好刷新的页面，运行器据此重发。
   report({ type: "started", id: command.id, kind: command.kind })
 
+  // 执行期间不需要单独发“我还活着”：信标（beacon）一直在跑，主线程的
+  // mainTickAt 会如实反映同步段有没有把线程占满。
   currentCommandId = command.id
-  const heartbeat = setInterval(() => {
-    report({ type: "busy", id: command.id, elapsedMs: Math.round(performance.now() - startedAt) })
-  }, heartbeatMs)
 
   try {
     const value = await withTimeout(executeCommand(command), commandTimeoutMs, command.kind)
@@ -267,7 +361,6 @@ async function handleCommand(command) {
     })
   }
   finally {
-    clearInterval(heartbeat)
     currentCommandId = null
   }
 }
@@ -302,6 +395,7 @@ async function start() {
     return
   }
   installHook()
+  startBeacons()
   report({
     type: "hello",
     protocol: PROTOCOL_VERSION,

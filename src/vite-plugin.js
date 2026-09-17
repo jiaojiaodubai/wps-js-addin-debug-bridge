@@ -21,6 +21,8 @@ import { CLIENT_OPTIONS_GLOBAL, bridgeClientOptions, createBridgeMiddleware } fr
  * @param {string} [options.readyCheck] 页面就绪判定的 JS 表达式，默认等 WPS 加载项的 Ribbon 回调
  * @param {number} [options.readyTimeoutMs] 等待页面就绪的上限，默认 90000
  * @param {number} [options.commandTimeoutMs] 单条命令在页面里的执行上限，默认 120000
+ * @param {number} [options.heartbeatMs] 页面侧信标间隔（ms），默认 5000
+ * @param {number} [options.blockedAfterMs] 信标/主线程多久没动静算异常（ms），默认 15000
  * @param {string|boolean} [options.token] 是否要求页面/终端带上 token（`true` 为随机生成）
  * @param {(context: { host: string, origin: string }) => boolean} [options.originGuard] 自定义放行规则
  * @param {string|false} [options.portFile] 端口/token 落地文件，默认项目目录下的 .wps-bridge.json

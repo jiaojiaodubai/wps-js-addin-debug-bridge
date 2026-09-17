@@ -16,8 +16,16 @@
 
 import { CLIENT_TTL_MS, describeCommand } from "./protocol.js"
 
-/** 页面多久没上报心跳就认为被卡住（宿主弹窗会冻结页面，心跳自然也就停了）。 */
-export const DEFAULT_BLOCKED_AFTER_MS = 5_000
+/**
+ * 两个“多久没动静算异常”共用的时间常数（默认信标间隔 5 s 的 3 倍，容忍漏两拍）。
+ *
+ * 信标由页面里的 Web Worker 发送，长任务的同步段饿不死它，所以信标停了基本就是
+ * “页面进程没了”（offline）；信标还在、但 mainTickAt 不动，则是“主线程不推进”
+ * （stalled：长同步任务或宿主弹窗，外面分不出是哪种，就不猜）。
+ * 15 s 同时与 Chromium 判定页面无响应的桌面阈值一致
+ * （components/input/input_constants.h 的 kHungRendererDelay）。
+ */
+export const DEFAULT_BLOCKED_AFTER_MS = 15_000
 
 /** 默认事件日志容量。 */
 export const DEFAULT_EVENT_LIMIT = 5_000
@@ -25,8 +33,8 @@ export const DEFAULT_EVENT_LIMIT = 5_000
 /** 默认命令队列上限。 */
 export const DEFAULT_QUEUE_LIMIT = 1_000
 
-/** 不进事件日志的控制事件：心跳/签到只用来更新客户端状态，不该污染日志流。 */
-const EPHEMERAL_EVENTS = new Set(["busy", "seen"])
+/** 不进事件日志的控制事件：信标/签到只用来更新客户端状态，不该污染日志流。 */
+const EPHEMERAL_EVENTS = new Set(["beacon", "busy", "seen"])
 
 /**
  * 有上限的事件日志（环形缓冲）。
@@ -83,12 +91,14 @@ export function createEventLog(limit = DEFAULT_EVENT_LIMIT) {
 }
 
 /**
- * 客户端登记表：谁接上了、最后说话是什么时候、是不是正在忙、是不是被弹窗卡住了。
+ * 客户端登记表：谁接上了、信标还新不新、主线程还在不在推进、有没有命令在执行。
  *
- * 状态是**推导**出来的，不是页面自己声明的：
- *   idle    没有命令在执行；
- *   busy    有命令在执行，且心跳没断（长时间命令也能看出来）；
- *   blocked 有命令在执行，但心跳停了 —— 大概率是宿主弹窗冻结了页面。
+ * 状态是**推导**出来的，不是页面自己声明的，而且靠的是两条独立信号：
+ *   idle    信标正常、主线程在推进、没有命令在执行；
+ *   busy    有命令在执行，且主线程还在推进（长命令也能看出来）；
+ *   stalled 信标正常（页面进程还在），但主线程超过阈值没有推进 ——
+ *           长同步任务与宿主弹窗都会这样，从外面分不出是哪种，所以不猜；
+ *   offline 信标停了 —— 页面进程没了（关闭、崩溃）。
  * 这样终端就不用靠“45 s 空闲宽限”去猜了。
  */
 export function createClientRegistry({ ttlMs = CLIENT_TTL_MS, blockedAfterMs = DEFAULT_BLOCKED_AFTER_MS } = {}) {
@@ -100,7 +110,16 @@ export function createClientRegistry({ ttlMs = CLIENT_TTL_MS, blockedAfterMs = D
     let client = clients.get(id)
     if (!client) {
       const now = Date.now()
-      client = { id, connectedAt: now, lastSeen: now, busyCommandId: null, busySince: 0, lastHeartbeat: 0 }
+      client = {
+        id,
+        connectedAt: now,
+        lastSeen: now,
+        lastBeacon: now,
+        mainTickAt: now,
+        beaconMode: "",
+        busyCommandId: null,
+        busySince: 0,
+      }
       clients.set(id, client)
       connected.push(id)
     }
@@ -117,14 +136,19 @@ export function createClientRegistry({ ttlMs = CLIENT_TTL_MS, blockedAfterMs = D
   }
 
   function stateOf(client, now) {
-    if (!client.busyCommandId) return "idle"
-    return now - client.lastHeartbeat > blockedAfterMs ? "blocked" : "busy"
+    // 信标来自独立线程：它停了就是页面真没了（不是被长任务饿死）
+    if (now - client.lastBeacon > blockedAfterMs) return "offline"
+    // 信标在、主线程不推进：长同步任务与宿主弹窗都可能，不装能分清
+    if (now - client.mainTickAt > blockedAfterMs) return "stalled"
+    return client.busyCommandId ? "busy" : "idle"
   }
 
   return {
     touch(id, now = Date.now()) {
       const client = ensure(id)
+      // 能发事件的都是主线程（长轮询、日志、命令生命周期），顺便记为“主线程还活着”
       client.lastSeen = now
+      client.mainTickAt = now
       return client
     },
 
@@ -133,8 +157,8 @@ export function createClientRegistry({ ttlMs = CLIENT_TTL_MS, blockedAfterMs = D
       const client = ensure(id)
       client.busyCommandId = commandId
       client.busySince = now
-      client.lastHeartbeat = now
       client.lastSeen = now
+      client.mainTickAt = now
       return client
     },
 
@@ -144,13 +168,18 @@ export function createClientRegistry({ ttlMs = CLIENT_TTL_MS, blockedAfterMs = D
       client.busyCommandId = null
       client.busySince = 0
       client.lastSeen = now
+      client.mainTickAt = now
       return client
     },
 
-    markHeartbeat(id, now = Date.now()) {
+    /** 收到 beacon（页面任意线程发出）：更新信标与主线程的最后活动时间。 */
+    markBeacon(id, { mainTickAt, mode } = {}, now = Date.now()) {
       const client = ensure(id)
-      client.lastHeartbeat = now
+      const tick = Number(mainTickAt)
+      client.lastBeacon = now
       client.lastSeen = now
+      if (Number.isFinite(tick) && tick > 0) client.mainTickAt = Math.min(tick, now)
+      if (mode) client.beaconMode = String(mode)
       return client
     },
 
@@ -170,6 +199,9 @@ export function createClientRegistry({ ttlMs = CLIENT_TTL_MS, blockedAfterMs = D
         id: client.id,
         state: stateOf(client, now),
         idleMs: now - client.lastSeen,
+        beaconAgeMs: now - client.lastBeacon,
+        mainStallMs: now - client.mainTickAt,
+        beaconMode: client.beaconMode || null,
         busyCommandId: client.busyCommandId,
         busyMs: client.busySince ? now - client.busySince : 0,
       }))
@@ -237,7 +269,7 @@ export function createCommandQueue({ limit = DEFAULT_QUEUE_LIMIT } = {}) {
  * @param {number} [options.eventBufferSize] 事件日志容量
  * @param {number} [options.maxQueuedCommands] 命令队列上限
  * @param {number} [options.clientTtlMs] 客户端空闲多久算断开
- * @param {number} [options.blockedAfterMs] 多久没心跳算被卡住
+ * @param {number} [options.blockedAfterMs] 信标/主线程多久没动静算异常
  */
 export function createBridge(options = {}) {
   const events = createEventLog(options.eventBufferSize ?? DEFAULT_EVENT_LIMIT)
@@ -273,6 +305,7 @@ export function createBridge(options = {}) {
     if (event.clientId) {
       if (event.type === "started") clients.markBusy(event.clientId, event.id)
       else if (event.type === "result") clients.markIdle(event.clientId)
+      else if (event.type === "beacon") clients.markBeacon(event.clientId, event)
       else clients.touch(event.clientId)
     }
     if (EPHEMERAL_EVENTS.has(event.type)) return null

@@ -40,23 +40,46 @@ test("事件日志：clear 之后重新从 1 开始", () => {
   assert.equal(log.since(0)[0].seq, 1)
 })
 
-test("客户端状态：busy / blocked / idle 都由心跳推导", () => {
+test("客户端状态：信标与主线程活动是两条独立信号", () => {
   const clients = createClientRegistry({ ttlMs: 10_000, blockedAfterMs: 1_000 })
   const now = 1_000_000
+
+  // 主线程发过 hello / 长轮询：接入，两个时间戳都算“刚刚活过”
+  clients.touch("page-1", now)
+  assert.equal(clients.list(now)[0].state, "idle")
 
   clients.markBusy("page-1", "cmd-1", now)
   assert.equal(clients.list(now)[0].state, "busy")
   assert.equal(clients.list(now)[0].busyCommandId, "cmd-1")
 
-  // 长命令照样有心跳 —— 那它就是在跑
-  clients.markHeartbeat("page-1", now + 900)
+  // 长命令只要主线程还在推进（信标如实带着新的 mainTickAt），就是 busy
+  clients.markBeacon("page-1", { mainTickAt: now + 900, mode: "worker" }, now + 900)
   assert.equal(clients.list(now + 1_500)[0].state, "busy")
 
-  // 心跳停了：多半是宿主弹窗把页面冻住了
-  assert.equal(clients.list(now + 3_000)[0].state, "blocked")
+  // 信标照常到达，但 mainTickAt 停在原处：主线程不推进 → stalled
+  // （长同步任务与宿主弹窗都会这样，外面分不出是哪种，所以不猜）
+  clients.markBeacon("page-1", { mainTickAt: now + 900, mode: "worker" }, now + 2_200)
+  const stalled = clients.list(now + 2_500)[0]
+  assert.equal(stalled.state, "stalled")
+  assert.equal(stalled.mainStallMs, 1_600)
+  assert.equal(stalled.beaconAgeMs, 300)
+  assert.equal(stalled.beaconMode, "worker")
 
-  clients.markIdle("page-1", now + 3_100)
-  assert.equal(clients.list(now + 3_200)[0].state, "idle")
+  // 信标也停了：页面进程没了 → offline（而不是靠“多久没命令”去猜）
+  assert.equal(clients.list(now + 3_600)[0].state, "offline")
+
+  // 页面刷新后重新接入，一切照旧
+  clients.markBeacon("page-1", { mainTickAt: now + 4_000, mode: "worker" }, now + 4_000)
+  assert.equal(clients.list(now + 4_100)[0].state, "busy")
+  clients.markIdle("page-1", now + 4_200)
+  assert.equal(clients.list(now + 4_300)[0].state, "idle")
+})
+
+test("客户端状态：未来的 mainTickAt 不会让 stall 变负数", () => {
+  const clients = createClientRegistry({ blockedAfterMs: 1_000 })
+  const now = 2_000_000
+  clients.markBeacon("page-1", { mainTickAt: now + 999_999, mode: "worker" }, now)
+  assert.equal(clients.list(now)[0].mainStallMs, 0)
 })
 
 test("客户端登记表：空闲超时会清掉，newest 取接入最晚的那个", () => {
@@ -122,17 +145,19 @@ test("桥：队列满了要明确报错，而不是无限堆积", () => {
   assert.match(full.error, /队列已满/)
 })
 
-test("桥：心跳不进事件日志，但会更新客户端状态", () => {
+test("桥：信标不进事件日志，但会更新客户端状态", () => {
   const bridge = createBridge()
-  bridge.record({ type: "hello", clientId: "page-1", protocol: 2 })
+  bridge.record({ type: "hello", clientId: "page-1" })
   const before = bridge.events.latestSeq
 
   bridge.record({ type: "started", clientId: "page-1", id: "cmd-1" })
-  const heartbeat = bridge.record({ type: "busy", clientId: "page-1", id: "cmd-1" })
+  const beacon = bridge.record({ type: "beacon", clientId: "page-1", mode: "worker", mainTickAt: Date.now() })
 
-  assert.equal(heartbeat, null, "心跳不该返回事件记录")
+  assert.equal(beacon, null, "信标不该返回事件记录")
   assert.equal(bridge.events.latestSeq, before + 1, "只有 started 进了日志")
-  assert.equal(bridge.status().clients[0].state, "busy")
+  const client = bridge.status().clients[0]
+  assert.equal(client.state, "busy")
+  assert.equal(client.beaconMode, "worker")
 
   bridge.record({ type: "result", clientId: "page-1", id: "cmd-1", ok: true })
   assert.equal(bridge.status().clients[0].state, "idle")

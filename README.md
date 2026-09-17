@@ -94,6 +94,7 @@ createServer((request, response) => {
 npx wps-bridge status                    # 页面接上了吗（端口自动发现）
 npx wps-bridge click btnRunTests         # 触发 Ribbon 控件
 npx wps-bridge run ./test/perf.ts --expect-report
+npx wps-bridge run ./test/perf.ts --expect-report --launch   # 没页面就自动开 WPS，跑完自动关
 npx wps-bridge eval "return Application.Version"
 ```
 
@@ -134,7 +135,7 @@ else {
 
 | 命令 | 作用 |
 | --- | --- |
-| `status` | 看桥与页面的连接状态（每个页面是空闲、在跑、还是被卡住） |
+| `status` | 看桥与页面的连接状态（每个页面是空闲、在跑、还是无响应/失联） |
 | `click <控件Id>` | 调用页面里同名回调（WPS 加载项即 `window.OnAction`） |
 | `call <模块> <函数>` | 动态 import 该模块并调用函数，参数用 `--arg` / `--args` 传 |
 | `run <文件>` | 在页面里执行一个模块文件（支持 `.ts`，由 dev server 编译） |
@@ -153,9 +154,13 @@ wps-bridge run ./src/modules/refresh.ts --export refreshAll
 - 只对**开发模式**生效，发布构建里没有任何桥代码。
 - 页面必须由带桥的 dev server 提供；改了桥的代码后要重启 dev server，
   并让宿主重新加载加载项页面（`wps-bridge status` 可确认是否已接入）。
-- 宿主弹窗会冻结页面：`status` 会把这种页面标成 `blocked`，先关掉弹窗即可恢复。
-- WPS 通常单实例运行：`--launch` 会复用已打开的实例，页面列表里可能同时存在多个历史连接；
-  命令默认只发给**最新且没被卡住**的那个页面。
+- 宿主弹窗会冻结页面：`status` 会把这种页面标成 `stalled`（主线程无响应）——
+  信标还能到达（它由页面里的 Web Worker 独立线程发送），但主线程不再推进；
+  长同步任务看起来一样，桥不猜是哪种，看一眼 WPS 里有没有弹窗即可。
+  信标也停了才是 `offline`（页面关闭、崩溃）。
+- 由 `--launch` 启动的 WPS 跑完会被关掉（`--keep-wps` 可保留）；本来就开着的
+  实例桥不会动。WPS 通常单实例：`--launch` 会复用已打开的实例，页面列表里可能
+  同时存在多个历史连接，命令默认只发给**最新且信标正常、主线程在推进**的那个页面。
 
 ## 文档
 

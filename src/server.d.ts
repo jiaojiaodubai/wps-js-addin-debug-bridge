@@ -31,6 +31,8 @@ export interface BridgeOptions {
   readyTimeoutMs?: number
   /** 单条命令在页面里的执行上限（ms），默认 120000。 */
   commandTimeoutMs?: number
+  /** 页面侧信标间隔（ms），默认 5000。 */
+  heartbeatMs?: number
   /** 是否要求页面/终端带上 token（`true` 为随机生成），默认关闭。 */
   token?: string | boolean
   /** 自定义放行规则；默认只接受本机同源请求。 */
@@ -43,7 +45,7 @@ export interface BridgeOptions {
   maxQueuedCommands?: number
   /** 客户端空闲多久算断开（ms），默认 45000。 */
   clientTtlMs?: number
-  /** 多久没有心跳算被卡住（ms），默认 5000。 */
+  /** 信标/主线程多久没动静算异常（失联/无响应，ms），默认 15000。 */
   blockedAfterMs?: number
 }
 
@@ -51,14 +53,26 @@ export interface BridgeClientOptions {
   readyCheck: string
   readyTimeoutMs?: number
   commandTimeoutMs?: number
+  heartbeatMs?: number
   token?: string
 }
 
 export interface ClientStatus {
   id: string
-  /** idle：空闲；busy：正在执行；blocked：执行中心跳停了（多半被宿主弹窗冻结）。 */
-  state: "idle" | "busy" | "blocked"
+  /**
+   * idle：信标正常、主线程在推进、空闲；
+   * busy：正在执行命令，主线程还在推进；
+   * stalled：信标正常（页面还在），但主线程超过阈值没推进（宿主弹窗或长同步任务）；
+   * offline：信标停了 —— 页面进程没了（关闭、崩溃）。
+   */
+  state: "idle" | "busy" | "stalled" | "offline"
   idleMs: number
+  /** 信标有多旧（ms）。 */
+  beaconAgeMs: number
+  /** 主线程多久没推进（ms）。 */
+  mainStallMs: number
+  /** 信标来源："worker"（独立线程）或 "main"（兜底）。 */
+  beaconMode: "worker" | "main" | null
   busyCommandId: string | null
   busyMs: number
 }

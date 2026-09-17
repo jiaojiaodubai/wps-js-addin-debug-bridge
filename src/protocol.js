@@ -40,8 +40,11 @@ export const DEFAULT_REPORT_PATTERN = "tests=(\\d+) passed=(\\d+) failed=(\\d+)"
  * 页面由 dev server 下发，正常情况下两边永远同版本；不一致只会出现在
  * “dev server 重启过、但加载项页面还是旧的”这种场景。这时明确报错
  * （并提示重新加载加载项）比让命令莫名其妙地失败要好得多。
+ *
+ * v3：信标（beacon）取代 busy 心跳，并携带主线程的 mainTickAt；
+ *     客户端状态从 idle/busy/blocked 改为 idle/busy/stalled/offline。
  */
-export const PROTOCOL_VERSION = 2
+export const PROTOCOL_VERSION = 3
 
 /** 客户端脚本地址带上版本，避免浏览器/宿主缓存旧客户端。 */
 export const CLIENT_SCRIPT_URL = `${CLIENT_SCRIPT_PATH}?v=${PROTOCOL_VERSION}`

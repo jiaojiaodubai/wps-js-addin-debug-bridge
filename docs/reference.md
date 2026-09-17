@@ -110,7 +110,8 @@ wps-bridge call /src/a.ts run --arg hello --arg 2 --arg true --arg "[1,2]"
 | `--follow <ms>` | 命令返回后继续收集日志的时长（默认 0） |
 | `--arg <值>` / `--args <json>` | `call` / `run` 的调用参数 |
 | `--token <值>` | 桥要求 token 时用（一般会从 `.wps-bridge.json` 自动读到） |
-| `--launch` / `--doc <path>` | 等不到页面时自动启动 WPS（可指定打开的文档） |
+| `--launch` / `--doc <path>` | 等不到页面时自动启动 WPS（可指定打开的文档）；跑完把它关掉 |
+| `--keep-wps` | 本次启动的 WPS 保留不关（调试用） |
 | `--exe <path>` | 指定 `wps.exe`（也可用环境变量 `WPS_EXE`） |
 | `--start <命令>` | 本地没有 dev server 时用它启动，默认 `npm run dev` |
 | `--keep-server` | 本次启动的 dev server 保留不关 |
@@ -129,15 +130,23 @@ wps-bridge run ./test/perf.ts --expect-report > 报告.txt
 ```
 
 `status` 会把机器可读的 JSON 写到 stdout，每个页面都带一个**推导出来的**状态
-（不是页面自报的，而是从心跳与命令生命周期推出来的）：
+（不是页面自报的，而是从两条独立信号推出来的）：
 
-| state | 含义 | 怎么办 |
+- **信标（beacon）**：页面里的 Web Worker 按 `heartbeatMs`（默认 5 s）上报，
+  不受长任务影响 —— 它停了就是页面进程没了；
+- **主线程进度**：信标带着主线程最近一次 tick 的时间戳 —— 它不动，说明主线程被占住了。
+
+| state | 含义（推导） | 怎么办 |
 | --- | --- | --- |
-| `idle` | 空闲，随时能接命令 | —— |
-| `busy` | 正在执行命令，心跳正常 | 等；页面侧执行上限见 `commandTimeoutMs` |
-| `blocked` | 正在执行，但**心跳停了** | 多半是宿主弹窗冻结了页面，先关掉弹窗 |
+| `idle` | 信标正常、主线程在推进、空闲 | —— |
+| `busy` | 正在执行命令，主线程还在推进 | 等；页面侧执行上限见 `commandTimeoutMs` |
+| `stalled` | 信标正常（页面还在），但主线程超过阈值没推进 | 先看 WPS 里有没有弹窗；也可能是长同步任务，等它跑完 |
+| `offline` | 信标停了 | 页面多半已关闭或崩溃：重启宿主 / 重新加载加载项 |
 
-超时时桥会先看一眼页面状态，直接告诉你“在跑”还是“被弹窗卡住”，而不是只说超时。
+超过 `blockedAfterMs`（默认 15 s = 信标间隔的 3 倍，与 Chromium 判定“页面无响应”的
+桌面阈值一致）就分开报：信标停了标 `offline`，信标在但主线程不推进标 `stalled`。
+`stalled` 只说明“主线程不推进”：长同步任务与宿主弹窗从外面分不出来，桥不替你猜。
+超时提示也按这两种情况分开说，而不是只说“超时”。
 
 退出码（也是 `bin/cli.js` 与 `npm script` 的契约）：
 
@@ -196,7 +205,7 @@ export default function createReporter({ pattern }) {
 dev server 启动后会把一行 JSON 写进**项目目录**的 `.wps-bridge.json`：
 
 ```json
-{ "protocol": 2, "port": 3889, "token": null, "pid": 12345, "startedAt": "2026-09-17T02:00:00.000Z" }
+{ "protocol": 3, "port": 3889, "token": null, "pid": 12345, "startedAt": "2026-09-17T02:00:00.000Z" }
 ```
 
 终端侧从当前目录**一路往上**找这个文件（和 vite 找 workspace root 一个思路），
@@ -262,8 +271,14 @@ import { createBridgeMiddleware, injectBridgeClient } from "wps-js-addin-debug-b
 | `eventBufferSize` | `5000` | 事件日志容量 |
 | `maxQueuedCommands` | `1000` | 命令队列上限（满了明确报错，不无限堆积） |
 | `clientTtlMs` | `45000` | 客户端空闲多久算断开 |
-| `blockedAfterMs` | `5000` | 多久没心跳算被卡住 |
+| `heartbeatMs` | `5000` | 页面侧信标间隔（由 Web Worker 发送） |
+| `blockedAfterMs` | `15000` | 信标/主线程多久没动静算异常（失联 / 无响应） |
 | `log` / `quiet` / `logger` | —— | 诊断输出（走 stderr） |
+
+个别项目需要更灵敏（或更迟钝）的状态判别时，在项目侧覆盖这两个参数就行，
+不要为个例改动桥的默认值：`blockedAfterMs` 按 `heartbeatMs` 的 **3 倍**跟调
+（默认 5000 / 15000 就是这个比例，容忍漏两拍），比例压得太紧会把长同步任务
+误报成 `stalled`。
 
 类型声明随包提供（`src/server.d.ts`、`src/vite-plugin.d.ts`）。
 
@@ -274,7 +289,7 @@ import { createBridgeMiddleware, injectBridgeClient } from "wps-js-addin-debug-b
 注入到加载项页面的客户端会挂两个全局对象：
 
 ```js
-window.__wpsDebugBridgeOptions   // dev server 注入的配置：readyCheck / commandTimeoutMs / token…
+window.__wpsDebugBridgeOptions   // dev server 注入的配置：readyCheck / commandTimeoutMs / heartbeatMs / token…
 window.__wpsDebugBridge          // 运行时句柄：{ clientId, protocol, notify(text) }
 ```
 
