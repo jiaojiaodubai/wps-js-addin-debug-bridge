@@ -1,6 +1,6 @@
 {
   "name": "wps-js-addin-debug-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "WPS JS 加载项开发期调试桥：在终端里触发 Ribbon 入口、在运行中的加载项里执行代码",
   "type": "module",
   "license": "MIT",
